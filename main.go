@@ -37,7 +37,6 @@ func GenerateKeyPair() *KeyPair {
 			Y: y,
 		},
 	}
-
 }
 
 func GenerateMetaAddress() (string, []byte, []byte, error) {
@@ -60,14 +59,6 @@ func GenerateMetaAddress() (string, []byte, []byte, error) {
 	output := string(metaAddress)
 
 	return output, spendingKeyPair.Private, viewingKeyPair.Private, nil
-}
-
-func GenerateThreeKeyPairs() (*KeyPair, *KeyPair, *KeyPair) {
-	spendingKeyPair := GenerateKeyPair()
-	viewingKeyPair := GenerateKeyPair()
-	ephemeralKeyPair := GenerateKeyPair()
-
-	return spendingKeyPair, viewingKeyPair, ephemeralKeyPair
 }
 
 func GetKeysFromMetaAddress(metaAddress string) (*PubKey, *PubKey, error) {
@@ -103,19 +94,19 @@ func AddEip55Prefix(hex []byte) []byte {
 	return append([]byte{'0', 'x'}, hex...)
 }
 
-func GenerateStealthAddress(metaAddress string) (common.Address, *PubKey, byte, error) {
+func GenerateStealthAddress(stealthMetaAddress string) (common.Address, *PubKey, byte, error) {
 	// generate a random 32-byte entropy ephemeral private key
 	ephemeralKeyPair := GenerateKeyPair()
 
 	// parse the spending and viewing public keys
-	spendingPubKey, viewingPubKey, err := GetKeysFromMetaAddress(metaAddress)
+	spendingPubKey, viewingPubKey, err := GetKeysFromMetaAddress(stealthMetaAddress)
 	if err != nil {
 		return common.Address{}, nil, 0, err
 	}
 
 	// computing shared secret
 	x, y := secp256k1.S256().ScalarMult(viewingPubKey.X, viewingPubKey.Y, ephemeralKeyPair.Private)
-	fmt.Println(x, y)
+	// fmt.Println(x, y)
 
 	h := sha256.New()
 	_, err = h.Write(x.Bytes())
@@ -130,7 +121,7 @@ func GenerateStealthAddress(metaAddress string) (common.Address, *PubKey, byte, 
 	// the secret is hashed
 	sh := h.Sum(nil)
 
-	// view tag
+	// the view tag is extracted by taking the most significant byte of sh
 	v := sh[0]
 
 	// multiply the hashed shared secret with the generator point
@@ -149,7 +140,50 @@ func GenerateStealthAddress(metaAddress string) (common.Address, *PubKey, byte, 
 	stealthAddress := crypto.PubkeyToAddress(stealthPubkey)
 
 	return stealthAddress, &ephemeralKeyPair.Public, v, nil
+}
 
+func CheckStealthAddress(stealthAddress common.Address, ephemeralPubKey *PubKey, viewingKey []byte, spendingPubKey *PubKey, viewTag byte) (bool, error) {
+	// shared secret is computed by multiplying the viewing private key with the ephemeral public key of the announcement
+	x, y := secp256k1.S256().ScalarMult(ephemeralPubKey.X, ephemeralPubKey.Y, viewingKey)
+	// fmt.Println(x, y)
+
+	h := sha256.New()
+	_, err := h.Write(x.Bytes())
+	if err != nil {
+		return false, err
+	}
+	_, err = h.Write(y.Bytes())
+	if err != nil {
+		return false, err
+	}
+
+	// the secret is hashed
+	sh := h.Sum(nil)
+
+	// the view tag is extracted by taking the most significant byte and can be compared to the given view tag
+	if sh[0] != viewTag {
+		return false, nil
+	}
+
+	// multiply the hashed shared secret with the generator point
+	sx, sy := secp256k1.S256().ScalarBaseMult(sh)
+
+	// the stealth public key is computed
+	stealthPubX, stealthPubY := secp256k1.S256().Add(spendingPubKey.X, spendingPubKey.Y, sx, sy)
+
+	// the derived stealth address is computed
+	stealthPubkey := ecdsa.PublicKey{
+		Curve: secp256k1.S256(),
+		X:     stealthPubX,
+		Y:     stealthPubY,
+	}
+
+	derivedStealthAddress := crypto.PubkeyToAddress(stealthPubkey)
+	if derivedStealthAddress.Cmp(stealthAddress) != 0 {
+		return false, nil
+	}
+
+	return true, nil
 }
 
 func main() {
@@ -165,11 +199,14 @@ func main() {
 		return
 	}
 
-	_ = ephemeralPubKey
-	_ = viewTag
+	spendingPubKey, _, err := GetKeysFromMetaAddress(addr)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
 
-	x, y := secp256k1.S256().ScalarMult(ephemeralPubKey.X, ephemeralPubKey.Y, viewingPrivKey)
-	fmt.Println(x, y)
+	res, _ := CheckStealthAddress(stealthAddress, ephemeralPubKey, viewingPrivKey, spendingPubKey, viewTag)
+	fmt.Println(res)
 
 	fmt.Println("stealthAddress", stealthAddress)
 
