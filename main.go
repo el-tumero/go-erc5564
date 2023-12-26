@@ -94,6 +94,19 @@ func AddEip55Prefix(hex []byte) []byte {
 	return append([]byte{'0', 'x'}, hex...)
 }
 
+func HashCurvePoints(x *big.Int, y *big.Int) ([]byte, error) {
+	h := sha256.New()
+	_, err := h.Write(x.Bytes())
+	if err != nil {
+		return nil, err
+	}
+	_, err = h.Write(y.Bytes())
+	if err != nil {
+		return nil, err
+	}
+	return h.Sum(nil), nil
+}
+
 func GenerateStealthAddress(stealthMetaAddress string) (common.Address, *PubKey, byte, error) {
 	// generate a random 32-byte entropy ephemeral private key
 	ephemeralKeyPair := GenerateKeyPair()
@@ -106,20 +119,12 @@ func GenerateStealthAddress(stealthMetaAddress string) (common.Address, *PubKey,
 
 	// computing shared secret
 	x, y := secp256k1.S256().ScalarMult(viewingPubKey.X, viewingPubKey.Y, ephemeralKeyPair.Private)
-	// fmt.Println(x, y)
-
-	h := sha256.New()
-	_, err = h.Write(x.Bytes())
-	if err != nil {
-		return common.Address{}, nil, 0, err
-	}
-	_, err = h.Write(y.Bytes())
-	if err != nil {
-		return common.Address{}, nil, 0, err
-	}
 
 	// the secret is hashed
-	sh := h.Sum(nil)
+	sh, err := HashCurvePoints(x, y)
+	if err != nil {
+		return common.Address{}, nil, 0, err
+	}
 
 	// the view tag is extracted by taking the most significant byte of sh
 	v := sh[0]
@@ -136,7 +141,6 @@ func GenerateStealthAddress(stealthMetaAddress string) (common.Address, *PubKey,
 		X:     stealthPubX,
 		Y:     stealthPubY,
 	}
-
 	stealthAddress := crypto.PubkeyToAddress(stealthPubkey)
 
 	return stealthAddress, &ephemeralKeyPair.Public, v, nil
@@ -145,20 +149,12 @@ func GenerateStealthAddress(stealthMetaAddress string) (common.Address, *PubKey,
 func CheckStealthAddress(stealthAddress common.Address, ephemeralPubKey *PubKey, viewingKey []byte, spendingPubKey *PubKey, viewTag byte) (bool, error) {
 	// shared secret is computed by multiplying the viewing private key with the ephemeral public key of the announcement
 	x, y := secp256k1.S256().ScalarMult(ephemeralPubKey.X, ephemeralPubKey.Y, viewingKey)
-	// fmt.Println(x, y)
-
-	h := sha256.New()
-	_, err := h.Write(x.Bytes())
-	if err != nil {
-		return false, err
-	}
-	_, err = h.Write(y.Bytes())
-	if err != nil {
-		return false, err
-	}
 
 	// the secret is hashed
-	sh := h.Sum(nil)
+	sh, err := HashCurvePoints(x, y)
+	if err != nil {
+		return false, err
+	}
 
 	// the view tag is extracted by taking the most significant byte and can be compared to the given view tag
 	if sh[0] != viewTag {
@@ -177,7 +173,6 @@ func CheckStealthAddress(stealthAddress common.Address, ephemeralPubKey *PubKey,
 		X:     stealthPubX,
 		Y:     stealthPubY,
 	}
-
 	derivedStealthAddress := crypto.PubkeyToAddress(stealthPubkey)
 	if derivedStealthAddress.Cmp(stealthAddress) != 0 {
 		return false, nil
@@ -186,28 +181,71 @@ func CheckStealthAddress(stealthAddress common.Address, ephemeralPubKey *PubKey,
 	return true, nil
 }
 
+func ComputeStealthKey(stealthAddress common.Address, ephemeralPubKey *PubKey, viewingKey []byte, spendingKey []byte) ([]byte, error) {
+	// shared secret is computed by multiplying the viewing private key with the ephemeral public key of the announcement
+	x, y := secp256k1.S256().ScalarMult(ephemeralPubKey.X, ephemeralPubKey.Y, viewingKey)
+
+	// the secret is hashed
+	sh, err := HashCurvePoints(x, y)
+	if err != nil {
+		return nil, err
+	}
+
+	// the stealth private key is computed
+	shi := big.NewInt(0).SetBytes(sh)
+	ski := big.NewInt(0).SetBytes(spendingKey)
+
+	add := big.NewInt(0).Add(shi, ski)
+	mod := big.NewInt(0).Mod(add, secp256k1.S256().N)
+
+	// generate stealth address
+	stealthPubX, stealthPubY := secp256k1.S256().ScalarBaseMult(mod.Bytes())
+	stealthPubkey := ecdsa.PublicKey{
+		Curve: secp256k1.S256(),
+		X:     stealthPubX,
+		Y:     stealthPubY,
+	}
+	derivedStealthAddress := crypto.PubkeyToAddress(stealthPubkey)
+	if derivedStealthAddress.Cmp(stealthAddress) != 0 {
+		return nil, fmt.Errorf("addresses not equal")
+	}
+
+	return mod.Bytes(), nil
+}
+
 func main() {
-	addr, _, viewingPrivKey, err := GenerateMetaAddress()
+	// repeipient
+	metaAddr, spendingPrivKey, viewingPrivKey, err := GenerateMetaAddress()
 	if err != nil {
 		fmt.Println(err)
 		return
 	}
-	fmt.Println(addr)
-	stealthAddress, ephemeralPubKey, viewTag, err := GenerateStealthAddress(addr)
+	fmt.Println("metaAddress", metaAddr)
+
+	// sender
+	stealthAddress, ephemeralPubKey, viewTag, err := GenerateStealthAddress(metaAddr)
 	if err != nil {
 		fmt.Println(err)
 		return
 	}
 
-	spendingPubKey, _, err := GetKeysFromMetaAddress(addr)
+	// receipient
+	spendingPubKey, _, err := GetKeysFromMetaAddress(metaAddr)
 	if err != nil {
 		fmt.Println(err)
 		return
 	}
 
 	res, _ := CheckStealthAddress(stealthAddress, ephemeralPubKey, viewingPrivKey, spendingPubKey, viewTag)
-	fmt.Println(res)
+	fmt.Println("owner of this stealth address", res)
 
 	fmt.Println("stealthAddress", stealthAddress)
 
+	stealthPrivKey, err := ComputeStealthKey(stealthAddress, ephemeralPubKey, viewingPrivKey, spendingPrivKey)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+
+	fmt.Println("stealthPrivateKey", hexutil.Encode(stealthPrivKey))
 }
